@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -42,6 +44,64 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 	"gorm.io/plugin/opentelemetry/tracing"
 )
+
+type PrismResolver struct {
+	Host   string
+	Client *http.Client
+}
+
+func (pr *PrismResolver) GetDocument(ctx context.Context, didstr string) (*did.Document, error) {
+	// Extract account ID from did:prism:abc123 -> abc123
+	parts := strings.Split(didstr, ":")
+	if len(parts) != 3 || parts[1] != "prism" {
+		return nil, fmt.Errorf("invalid prism DID: %s", didstr)
+	}
+
+	accountId := parts[2]
+
+	// Prepare request body
+	reqBody := map[string]string{"id": accountId}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	// Make HTTP request to prism resolver
+	req, err := http.NewRequestWithContext(ctx, "POST", pr.Host+"/get-did-document", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := pr.Client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("prism resolver returned status %d", resp.StatusCode)
+	}
+
+	// Parse response
+	var result struct {
+		DidDocument *did.Document `json:"did_document"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	log.Debug("prism resolver response", "result", result)
+	if result.DidDocument == nil || result.DidDocument.ID.String() == "" {
+		return nil, fmt.Errorf("prism: empty did_document for %s", didstr)
+	}
+
+	return result.DidDocument, nil
+}
+
+func (pr *PrismResolver) FlushCacheFor(didstr string) {
+	// No cache to flush in this simple implementation
+}
 
 var log = slog.Default().With("system", "bigsky")
 
@@ -99,6 +159,12 @@ func run(args []string) error {
 		&cli.BoolFlag{
 			Name:  "crawl-insecure-ws",
 			Usage: "when connecting to PDS instances, use ws:// instead of wss://",
+		},
+		&cli.StringFlag{
+			Name:    "prism-host",
+			Usage:   "Prism DID resolver URL",
+			Value:   "", // Will fall back to environment variable or default
+			EnvVars: []string{"DID_PRISM_RESOLVER_URL", "ATP_PRISM_HOST"},
 		},
 		&cli.StringFlag{
 			Name:  "api-listen",
@@ -301,6 +367,40 @@ func setupOTEL(cctx *cli.Context) error {
 	return nil
 }
 
+type PDSHandleResolver struct {
+	Hosts  []string
+	Client *http.Client
+}
+
+func (r *PDSHandleResolver) ResolveHandleToDid(ctx context.Context, handle string) (string, error) {
+	type out struct {
+		DID string `json:"did"`
+	}
+
+	for _, base := range r.Hosts {
+		base = strings.TrimRight(base, "/")
+		if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
+			base = "http://" + base
+		}
+		u := base + "/xrpc/com.atproto.identity.resolveHandle?handle=" + url.QueryEscape(handle)
+		req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+		resp, err := r.Client.Do(req)
+		if err != nil {
+			slog.Warn("pds resolve failed", "host", base, "handle", handle, "err", err)
+			continue
+		}
+		if resp.StatusCode != 200 {
+			slog.Warn("pds resolve non-200", "host", base, "code", resp.StatusCode)
+			continue
+		}
+		var v out
+		if err := json.NewDecoder(resp.Body).Decode(&v); err == nil && v.DID != "" {
+			return v.DID, nil
+		}
+	}
+	return "", fmt.Errorf("no did record found for handle %q", handle)
+}
+
 func runBigsky(cctx *cli.Context) error {
 	// Trap SIGINT to trigger a shutdown.
 	signals := make(chan os.Signal, 1)
@@ -408,6 +508,21 @@ func runBigsky(cctx *cli.Context) error {
 		}
 		mr.AddHandler("web", &webr)
 
+		prismHost := cctx.String("prism-host")
+		if prismHost == "" {
+			// Use environment variable as fallback
+			prismHost = os.Getenv("DID_PRISM_RESOLVER_URL")
+			if prismHost == "" {
+				prismHost = "http://host.docker.internal:41997" // Default from your TypeScript config
+			}
+		}
+
+		prismr := &PrismResolver{
+			Host:   prismHost,
+			Client: &http.Client{Timeout: 30 * time.Second},
+		}
+		mr.AddHandler("prism", prismr)
+
 		var prevResolver did.Resolver
 		memcachedServers := cctx.StringSlice("did-memcached")
 		if len(memcachedServers) > 0 {
@@ -491,10 +606,25 @@ func runBigsky(cctx *cli.Context) error {
 		}
 	}
 
+	hosts := cctx.StringSlice("handle-resolver-hosts")
+	var usePDS bool
+	for _, h := range hosts {
+		if strings.HasPrefix(h, "http://") || strings.HasPrefix(h, "https://") {
+			usePDS = true
+			break
+		}
+	}
 	var hr handles.HandleResolver = prodHR
-	if cctx.StringSlice("handle-resolver-hosts") != nil {
-		hr = &handles.TestHandleResolver{
-			TrialHosts: cctx.StringSlice("handle-resolver-hosts"),
+	if len(hosts) > 0 {
+		if usePDS {
+			slog.Info("using PDSHandleResolver (dev, skipping DNS)", "hosts", hosts)
+			hr = &PDSHandleResolver{
+				Hosts:  hosts,
+				Client: &http.Client{Timeout: 15 * time.Second},
+			}
+		} else {
+			slog.Info("using TestHandleResolver (.well-known proxy mode)", "hosts", hosts)
+			hr = &handles.TestHandleResolver{TrialHosts: hosts}
 		}
 	}
 

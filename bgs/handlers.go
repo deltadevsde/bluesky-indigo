@@ -147,9 +147,9 @@ func (s *BGS) handleComAtprotoSyncRequestCrawl(ctx context.Context, body *comatp
 		return echo.NewHTTPError(http.StatusBadRequest, "failed to parse hostname")
 	}
 
-	if u.Scheme == "http" && s.ssl {
-		return echo.NewHTTPError(http.StatusBadRequest, "this server requires https")
-	}
+	// if u.Scheme == "http" && s.ssl {
+	// 	return echo.NewHTTPError(http.StatusBadRequest, "this server requires https")
+	// }
 
 	if u.Scheme == "https" && !s.ssl {
 		return echo.NewHTTPError(http.StatusBadRequest, "this server does not support https")

@@ -693,9 +693,9 @@ func (bgs *BGS) handleAdminRequestCrawl(e echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "failed to parse hostname")
 	}
 
-	if u.Scheme == "http" && bgs.ssl {
-		return echo.NewHTTPError(http.StatusBadRequest, "this server requires https")
-	}
+	//if u.Scheme == "http" && bgs.ssl {
+	//return echo.NewHTTPError(http.StatusBadRequest, "this server requires https")
+	//}
 
 	if u.Scheme == "https" && !bgs.ssl {
 		return echo.NewHTTPError(http.StatusBadRequest, "this server does not support https")
